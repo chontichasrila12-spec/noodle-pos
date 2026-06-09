@@ -1,33 +1,49 @@
 import streamlit as st
 import pandas as pd
 import datetime
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 
-# ตั้งค่าหน้าตาของแอปให้เป็นแนวกว้างและธีมสะอาดตา
+# ตั้งค่าหน้าตาของแอป
 st.set_page_config(page_title="ระบบจดออเดอร์ร้านก๋วยจั๊บ", layout="wide")
 
-# สไตล์ CSS ตกแต่งสไตล์มินิมอล โทนสีขาว เทา ดำ
 st.markdown("""
     <style>
     .main { background-color: #f8f9fa; }
     h1, h2, h3 { color: #212529; font-family: 'Helvetica Neue', sans-serif; }
     .stButton>button { background-color: #212529; color: white; border-radius: 5px; width: 100%; }
     .stButton>button:hover { background-color: #495057; color: white; }
-    .order-box { background-color: #ffffff; padding: 20px; border-radius: 10px; border: 1px solid #dee2e6; }
     </style>
 """, unsafe_allow_html=True)
 
-# เชื่อมต่อกับ Google Sheets ผ่าน Secrets ที่เราตั้งค่าไว้
-try:
-    conn = st.connection("gsheets", type=GSheetsConnection)
-    # ดึงข้อมูลจากแผ่นงานชื่อ orders
-    df_existing = conn.read(worksheet="orders", ttl=0)
-    # ล้างแถวที่เป็นค่าว่างออก
-    df_existing = df_existing.dropna(how="all")
-except Exception as e:
+# ฟังก์ชันเชื่อมต่อ Google Sheets แบบเสถียร
+def get_google_sheet():
+    try:
+        # ดึงลิงก์จาก Secrets
+        sheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+        
+        # ใช้สิทธิ์การเข้าถึงแบบเปิดสาธารณะที่แชร์ไว้ในการอ่าน/เขียนข้อมูล
+        gc = gspread.public(sheet_url)
+        # ดึงหน้าชีตชื่อ orders
+        worksheet = gc.worksheet("orders")
+        return worksheet
+    except Exception as e:
+        st.error(f"เกิดข้อผิดพลาดในการเชื่อมต่อฐานข้อมูล: {e}")
+        return None
+
+worksheet = get_google_sheet()
+
+# โหลดข้อมูลที่มีอยู่เดิมมาแสดงผลสถิติ
+if worksheet:
+    try:
+        data = worksheet.get_all_records()
+        df_existing = pd.DataFrame(data)
+    except:
+        df_existing = pd.DataFrame(columns=["วันที่", "เวลา", "เมนู", "จำนวน", "ท็อปปิ้ง", "รูปแบบ", "การชำระเงิน", "โน้ต", "ราคา"])
+else:
     df_existing = pd.DataFrame(columns=["วันที่", "เวลา", "เมนู", "จำนวน", "ท็อปปิ้ง", "รูปแบบ", "การชำระเงิน", "โน้ต", "ราคา"])
 
-# คลังข้อมูลเมนูและท็อปปิ้ง
+# คลังข้อมูลเมนู
 MENU = {
     "ก๋วยจั๊บธรรมดา": 50, "ก๋วยจั๊บสาหร่าย": 55, "ก๋วยจั๊บหมูเด้ง": 55,
     "ก๋วยจั๊บหมูเด้งสาหร่าย": 60, "ก๋วยจั๊บเล้ง": 60, "ก๋วยจั๊บตีนไก่": 60,
@@ -35,6 +51,81 @@ MENU = {
     "ก๋วยจั๊บหน้าล้น": 70, "ก๋วยจั๊บรวมพิเศษ": 75, "ก๋วยจั๊บต้มยำทะเลน้ำข้น": 75
 }
 
+TOPPINGS = {
+    "พิเศษ": 10, "ไข่": 10, "หมูเด้ง": 10, "หมูสับ": 10, "หมูยอ": 10,
+    "กุ้ง": 10, "หมึก": 10, "ปูอัด": 10, "เล้ง": 10, "น่อง": 10,
+    "ตีนไก่": 10, "เลือด": 5, "สาหร่าย": 5, "หอมเจียว": 5, "เส้น": 5
+}
+
+STOCK_ITEMS = ["เลือด", "เส้น", "หมูสับ", "กุ้ง", "หมูยอ", "หมึก", "หมูเด้ง", "สาหร่าย", "ไข่", "น้ำมะนาว", "หอมเจียว", "ตะเกียบ", "มาม่า"]
+
+if 'need_to_buy' not in st.session_state: st.session_state.need_to_buy = []
+if 'stock_notes' not in st.session_state: st.session_state.stock_notes = ""
+
+st.title("🍜 ระบบจัดการร้านก๋วยจั๊บ (ระบบสำรองออนไลน์)")
+st.caption(f"วันที่ใช้งาน: {datetime.date.today().strftime('%d/%m/%Y')}")
+
+tab1, tab2, tab3 = st.tabs(["🛒 รับออเดอร์ใหม่", "📊 สรุปยอดและสถิติ", "📦 เช็คสต็อกของในร้าน"])
+
+with tab1:
+    st.subheader("เพิ่มรายการอาหาร")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        selected_menu = st.selectbox("เลือกเมนูหลัก:", list(MENU.keys()))
+        base_price = MENU[selected_menu]
+        st.write(f"ราคาเริ่มต้น: **{base_price} บาท**")
+        selected_toppings = st.multiselect("เพิ่มท็อปปิ้ง:", list(TOPPINGS.keys()))
+        topping_price = sum([TOPPINGS[tp] for tp in selected_toppings])
+        quantity = st.number_input("จำนวน (ชาม):", min_value=1, value=1, step=1)
+        order_note = st.text_input("โน้ตเพิ่มเติม:", "")
+    with col2:
+        service_type = st.radio("รูปแบบการเสิร์ฟ:", ["ทานที่ร้าน", "กลับบ้าน"])
+        payment_type = st.radio("ช่องทางการชำระเงิน:", ["เงินสด", "เงินโอน", "ไทยช่วยไทย", "แกร้ป"])
+        
+        total_item_price = (base_price + topping_price) * quantity
+        if payment_type == "แกร้ป":
+            total_item_price = st.number_input("ระบุราคา Grab สุทธิ (บาท):", min_value=0, value=int(total_item_price))
+            
+        st.markdown(f"### ราคารวม: `{total_item_price}` บาท")
+        
+        if st.button("➕ บันทึกออเดอร์"):
+            if worksheet:
+                new_row = [
+                    datetime.date.today().strftime("%Y-%m-%d"),
+                    datetime.datetime.now().strftime("%H:%M:%S"),
+                    selected_menu,
+                    int(quantity),
+                    ", ".join(selected_toppings) if selected_toppings else "ไม่มี",
+                    service_type,
+                    payment_type,
+                    order_note if order_note else "-",
+                    int(total_item_price)
+                ]
+                # ส่งข้อมูลต่อท้ายตารางไปยัง Google Sheets โดยตรง ไม่ต้องสั่ง update ทับทั่งแผ่น
+                worksheet.append_row(new_row)
+                st.success("🎉 บันทึกออเดอร์และซิงค์ข้อมูลลง Google Sheets สำเร็จ!")
+                st.rerun()
+            else:
+                st.error("ไม่สามารถบันทึกได้เนื่องจากระบบเชื่อมต่อฐานข้อมูลปลายทางไม่สำเร็จ")
+
+with tab2:
+    st.subheader("📈 หน้าสรุปยอดปัจจุบัน")
+    if df_existing.empty:
+        st.info("ไม่มีข้อมูลในระบบ หรือกำลังโหลดข้อมูล...")
+    else:
+        st.dataframe(df_existing, use_container_width=True)
+        total = pd.to_numeric(df_existing["ราคา"], errors='coerce').sum()
+        st.markdown(f"## 🎉 รายรับรวมทั้งหมดในระบบชีต: `{total:,.2f}` ฿")
+
+with tab3:
+    st.subheader("📦 เช็คสต็อกของในร้าน")
+    current_selected = []
+    for item in STOCK_ITEMS:
+        if st.checkbox(f"❌ ต้องซื้อ: **{item}**", key=f"stock_{item}"):
+            current_selected.append(item)
+    st.session_state.need_to_buy = current_selected
+    if st.button("📋 พิมพ์ข้อความรายงานสต็อก"):
+        st.code(f"ของที่ต้องซื้อเพิ่ม: {', '.join(st.session_state.need_to_buy)}")
 TOPPINGS = {
     "พิเศษ": 10, "ไข่": 10, "หมูเด้ง": 10, "หมูสับ": 10, "หมูยอ": 10,
     "กุ้ง": 10, "หมึก": 10, "ปูอัด": 10, "เล้ง": 10, "น่อง": 10,
