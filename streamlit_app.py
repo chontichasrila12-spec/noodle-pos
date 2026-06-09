@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import datetime
+from streamlit_gsheets import GSheetsConnection
 
 # ตั้งค่าหน้าตาของแอปให้เป็นแนวกว้างและธีมสะอาดตา
 st.set_page_config(page_title="ระบบจดออเดอร์ร้านก๋วยจั๊บ", layout="wide")
@@ -15,6 +16,16 @@ st.markdown("""
     .order-box { background-color: #ffffff; padding: 20px; border-radius: 10px; border: 1px solid #dee2e6; }
     </style>
 """, unsafe_allow_html=True)
+
+# เชื่อมต่อกับ Google Sheets ผ่าน Secrets ที่เราตั้งค่าไว้
+try:
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    # ดึงข้อมูลจากแผ่นงานชื่อ orders
+    df_existing = conn.read(worksheet="orders", ttl=0)
+    # ล้างแถวที่เป็นค่าว่างออก
+    df_existing = df_existing.dropna(how="all")
+except Exception as e:
+    df_existing = pd.DataFrame(columns=["วันที่", "เวลา", "เมนู", "จำนวน", "ท็อปปิ้ง", "รูปแบบ", "การชำระเงิน", "โน้ต", "ราคา"])
 
 # คลังข้อมูลเมนูและท็อปปิ้ง
 MENU = {
@@ -37,14 +48,12 @@ STOCK_ITEMS = [
     "ถุงใส่ซุป", "ถุงหิ้วเล็ก", "ถุงหิ้วใหญ่", "ถุงใส่ก๋วยจั๊บ", "ถุงใส่พริกผัด", "พริกไทย", "มาม่า"
 ]
 
-if 'orders' not in st.session_state:
-    st.session_state.orders = []
 if 'need_to_buy' not in st.session_state:
     st.session_state.need_to_buy = []
 if 'stock_notes' not in st.session_state:
     st.session_state.stock_notes = ""
 
-st.title("🍜 ระบบจัดการร้านก๋วยจั๊บ")
+st.title("🍜 ระบบจัดการร้านก๋วยจั๊บ (ซิงค์ฐานข้อมูลออนไลน์)")
 st.caption(f"วันที่ใช้งาน: {datetime.date.today().strftime('%d/%m/%Y')}")
 
 tab1, tab2, tab3 = st.tabs(["🛒 รับออเดอร์ใหม่", "📊 สรุปยอดและสถิติ", "📦 เช็คสต็อกของในร้าน"])
@@ -76,10 +85,9 @@ with tab1:
         else:
             total_item_price = int(standard_total_price)
             st.markdown(f"### ราคารวมออเดอร์นี้: `{total_item_price}` บาท")
-            st.caption(f"(ราคาต่อชาม {single_price} บาท x {quantity} ชาม)")
         
         if st.button("➕ บันทึกออเดอร์"):
-            st.session_state.orders.append({
+            new_order = pd.DataFrame([{
                 "วันที่": datetime.date.today().strftime("%Y-%m-%d"),
                 "เวลา": datetime.datetime.now().strftime("%H:%M:%S"),
                 "เมนู": selected_menu,
@@ -89,17 +97,22 @@ with tab1:
                 "การชำระเงิน": payment_type,
                 "โน้ต": order_note if order_note else "-",
                 "ราคา": int(total_item_price)
-            })
-            st.success(f"บันทึกสำเร็จ: {selected_menu} {quantity} ชาม ({payment_type})")
+            }])
+            
+            # รวมข้อมูลเก่าและข้อมูลใหม่เข้าด้วยกันแล้วอัปเดตลง Google Sheets
+            updated_df = pd.concat([df_existing, new_order], ignore_index=True)
+            conn.update(worksheet="orders", data=updated_df)
+            st.success(f"บันทึกข้อมูลและซิงค์ไปที่ระบบกลางสำเร็จ! 🎉 ({selected_menu})")
+            st.rerun()
 
 with tab2:
-    st.subheader("📈 หน้าสรุปยอดและสถิติข้อมูล")
-    if not st.session_state.orders:
-        st.info("ยังไม่มีข้อมูลออเดอร์ในระบบ")
+    st.subheader("📈 หน้าสรุปยอดและสถิติข้อมูล (ดึงจากฐานข้อมูลกลาง)")
+    if df_existing.empty:
+        st.info("ยังไม่มีข้อมูลออเดอร์ในระบบคลาวด์")
         total_income = 0
         period_label = "รายวัน"
     else:
-        df = pd.DataFrame(st.session_state.orders)
+        df = df_existing.copy()
         df["วันที่"] = pd.to_datetime(df["วันที่"])
         
         st.markdown("### 🗓️ เลือกช่วงเวลาเพื่อดูสถิติยอดขาย")
@@ -119,33 +132,39 @@ with tab2:
             filtered_df = df[df["วันที่"] >= (today - pd.Timedelta(days=365))]
             period_label = "รายปี (365 วันย้อนหลัง)"
             
-        st.markdown(f"#### 📋 รายการบิลข้อมูล{period_label} (ดับเบิ้ลคลิกแก้ไขตัวเลขในตารางได้)")
+        st.markdown(f"#### 📋 รายการบิลข้อมูล{period_label} (ดับเบิ้ลคลิกแก้ไขตัวเลขในตารางได้ ยอดจะซิงค์ไปหลังบ้านทันที)")
         
         edited_df = st.data_editor(filtered_df, use_container_width=True, num_rows="dynamic")
         
-        for idx, row in edited_df.iterrows():
-            orig_indices = df.index[df['เวลา'] == row['เวลา']].tolist()
-            if orig_indices:
-                orig_idx = orig_indices[0]
-                st.session_state.orders[orig_idx]["เมนู"] = row["เมนู"]
-                st.session_state.orders[orig_idx]["จำนวน"] = row["จำนวน"]
-                st.session_state.orders[orig_idx]["ราคา"] = row["ราคา"]
-                st.session_state.orders[orig_idx]["การชำระเงิน"] = row["การชำระเงิน"]
+        # ปรับปรุงโครงสร้างข้อมูลหากมีการแก้ไขผ่านหน้าแอป
+        if st.button("💾 ยืนยันการอัปเดตข้อมูลแก้ไขบนคลาวด์"):
+            for idx, row in edited_df.iterrows():
+                orig_indices = df_existing.index[df_existing['เวลา'] == row['เวลา']].tolist()
+                if orig_indices:
+                    orig_idx = orig_indices[0]
+                    df_existing.at[orig_idx, "เมนู"] = row["เมนู"]
+                    df_existing.at[orig_idx, "จำนวน"] = row["จำนวน"]
+                    df_existing.at[orig_idx, "ราคา"] = row["ราคา"]
+                    df_existing.at[orig_idx, "การชำระเงิน"] = row["การชำระเงิน"]
+            conn.update(worksheet="orders", data=df_existing)
+            st.success("ซิงค์การแก้ไขข้อมูลกลับไปที่ระบบ Google Sheets เรียบร้อยแล้ว!")
+            st.rerun()
             
         df = edited_df
         
         st.markdown("---")
-        st.markdown("### 🗑️ จัดการลบออเดอร์ที่คีย์ผิด")
+        st.markdown("### 🗑️ จัดการลบออเดอร์ที่คีย์ผิดออกจากคลาวด์")
         delete_col1, delete_col2 = st.columns([1, 3])
         with delete_col1:
             row_to_delete = st.number_input("เลือกเลขแถวหน้าสุดที่ต้องการลบ:", min_value=0, max_value=max(0, len(df)-1), step=1, value=0)
         with delete_col2:
             st.write("")
             st.write("") 
-            if st.button("❌ ลบออเดอร์แถวนี้") and not df.empty:
+            if st.button("❌ ลบออเดอร์แถวนี้ออกจากเซิร์ฟเวอร์") and not df.empty:
                 actual_time = df.iloc[int(row_to_delete)]["เวลา"]
-                st.session_state.orders = [o for o in st.session_state.orders if o["เวลา"] != actual_time]
-                st.success(f"ลบออเดอร์เรียบร้อยแล้ว!")
+                df_existing = df_existing[df_existing["เวลา"] != actual_time]
+                conn.update(worksheet="orders", data=df_existing)
+                st.success(f"ลบข้อมูลออเดอร์ในระบบคลาวด์เรียบร้อย!")
                 st.rerun()
                 
         st.markdown("---")
@@ -153,6 +172,7 @@ with tab2:
         with c1:
             st.markdown(f"### 💰 ยอดรวมแยกประเภท ({period_label})")
             if not df.empty:
+                df["ราคา"] = pd.to_numeric(df["ราคา"])
                 income_by_pay = df.groupby("การชำระเงิน")["ราคา"].sum().reset_index()
                 for index, row in income_by_pay.iterrows():
                     st.write(f"- **{row['การชำระเงิน']}:** {row['ราคา']:.2f} ฿")
@@ -174,7 +194,6 @@ with tab2:
         st.markdown("---")
         st.markdown("### 📄 ดาวน์โหลดรายงานสรุปยอดและรายการสต็อกของที่ต้องซื้อ")
         
-        # ส่วนประกอบข้อความในไฟล์รายงาน
         summary_text = f"===================================\n   รายงานสรุปข้อมูลร้านก๋วยจั๊บ ({period_label})\n   วันที่ออกเอกสาร: {datetime.date.today().strftime('%d/%m/%Y')}\n===================================\n"
         summary_text += f"รายรับรวมช่วงเวลานี้: {total_income:,.2f} บาท\n-----------------------------------\n"
         
@@ -191,7 +210,6 @@ with tab2:
             summary_text += "------------------------------------------------------------------------------------------------------------------------\n"
             summary_text += f"{'วันที่':<12} | {'เวลา':<10} | {'เมนู':<25} | {'จำนวน':<6} | {'ราคา':<8} | {'ชำระเงิน':<12} | {'ท็อปปิ้ง':<25} | {'โน้ต'}\n"
             summary_text += "------------------------------------------------------------------------------------------------------------------------\n"
-            
             for idx, r in df.iterrows():
                 date_str = r['วันที่'].strftime('%Y-%m-%d') if isinstance(r['วันที่'], datetime.datetime) else str(r['วันที่'])[:10]
                 summary_text += f"{date_str:<12} | {str(r['เวลา']):<10} | {str(r['เมนู']):<25} | {str(r['จำนวน']):<6} | {str(r['ราคา']):<8} | {str(r['การชำระเงิน']):<12} | {str(r['ท็อปปิ้ง']):<25} | {str(r['โน้ต'])}\n"
@@ -213,9 +231,6 @@ with tab2:
             file_name=f"Full_Report_{stat_period}_{datetime.date.today().strftime('%Y%m%d')}.txt",
             mime="text/plain"
         )
-        if st.button("🚨 รีเซ็ตล้างข้อมูลออเดอร์ทั้งหมดในระบบ"):
-            st.session_state.orders = []
-            st.rerun()
 
 with tab3:
     st.subheader("📦 เช็คสต็อกของในร้าน (ติ๊กเลือกเฉพาะของที่หมดหรือต้องซื้อเพิ่ม)")
@@ -225,10 +240,8 @@ with tab3:
     items_per_col = len(STOCK_ITEMS) // 3 + 1
     
     current_selected = []
-    
     for idx, item in enumerate(STOCK_ITEMS):
         is_checked = item in st.session_state.need_to_buy
-        
         if idx < items_per_col:
             with sc1: 
                 if st.checkbox(f"❌ ต้องซื้อ: **{item}**", value=is_checked, key=f"chk_{item}"):
